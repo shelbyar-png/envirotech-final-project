@@ -1,12 +1,13 @@
-# envirotech-final-project
-
-# DIY Low-Cost Mini Meteorological Station 🌦️
+# Mini Met Station 🌦️
 
 A low-power remote weather station built on an **Adafruit Feather M0 Adalogger** with cellular (Blues Notecard) uplink. The station wakes every 10 minutes, records a suite of environmental sensors, logs the data locally to microSD, transmits it to the cloud, and then cuts its own power until the next cycle to conserve battery in the field.
 
 The system is **solar powered**, running on a solar panel and rechargeable battery pack, allowing it to operate autonomously off-grid.
 
 **Measured parameters:** air temperature & humidity, barometric pressure, rainfall, and solar irradiance.
+
+## About
+This project was developed for the graduate-level course **"Envirotech: DIY Sensors for Environmental Research"** taught by **Prof. Elad Levintal** at **Ben-Gurion University of the Negev**.
 
 ## Group Members
 - Shelby Kaplan
