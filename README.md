@@ -27,7 +27,7 @@ The Arduino firmware is included here. The full project report is provided in th
 | | |
 |---|---|
 | **Microcontroller** | Adafruit Feather M0 Adalogger |
-| **Sensors** | SHT31 (temp/RH), ICP10111 (pressure), SEN0575 (rain), RS485 solar sensor |
+| **Sensors** | SHT31 (temp/RH), ICP10111 (pressure), SEN0575 (rain), RS485 (solar sensor) |
 | **Connectivity** | Blues Wireless Notecard (cellular) |
 | **Power** | Solar panel + rechargeable battery |
 | **Storage** | microSD (local CSV backup) |
