@@ -1,12 +1,13 @@
 /*
  * ==================================================================================
  * Feather M0 Low-Power Remote Weather Station Array with Notecard Modem
- * Sensors: SHT31, ICP10111 (Pressure/Temp), SEN0575 Rain Gauge, RS485 Solar
- * I2C (SHT31/ICP/Rain): via DFRobot Gravity TCA9548A I2C Multiplexer (addr 0x70)
- *   on the Feather's main I2C bus — CH0=SHT31, CH1=ICP10111, CH2=Rain gauge
+ * Sensors: SHTC3 (Temp/RH), ICP10111 (Pressure/Temp), SEN0575 Rain Gauge, RS485 Solar
+ * I2C (SHTC3/ICP/Rain): via DFRobot Gravity TCA9548A I2C Multiplexer (addr 0x71 — moved
+ *   off the mux's default 0x70 because the SHTC3 sensor is FIXED at 0x70)
+ *   on the Feather's main I2C bus — CH0=SHTC3, CH1=ICP10111, CH2=Rain gauge
  * Storage: SanDisk Ultra 32GB MicroSD on Adalogger Hardware (Pin 4)
- * Modem: Blues Wireless Notecard (I2C Mode) with ATTN wired to Feather EN Pin
- * RS485 Solar: Hardware Serial1 (pins 0-1), 4800 baud
+ * Modem: Blues Wireless Notecard (Serial Mode on Serial1 / pins 0-1) with ATTN wired to Feather EN Pin
+ * RS485 Solar: Software SERCOM1 UART on pins 10 (RX) / 11 (TX)
  * Execution: 10-Minute Power-Gated Wake Cycles / 60-Minute Notehub Sync Window
  * ==================================================================================
  */
@@ -15,30 +16,35 @@
 #include <Wire.h>                   // Manages the I2C bus that reaches the multiplexer and, through it, each sensor.
 #include <SPI.h>                    // Manages the SPI bus used by the microSD card reader.
 #include <SD.h>                     // Reads and writes the CSV log file on the microSD card.
-#include <Adafruit_SHT31.h>         // Library for the SHT31 temperature/humidity sensor.
+#include <Adafruit_SHTC3.h>         // Library for the SHTC3 temperature/humidity sensor (needs Adafruit BusIO + Unified Sensor).
 #include <DFRobot_ICP10111.h>       // Library for the ICP10111 barometric pressure sensor.
 #include <DFRobot_RainfallSensor.h> // Library for the SEN0575 tipping-bucket rain gauge.
 #include <ModbusMaster.h>           // Processes the RS485 Modbus packets from the solar meter.
 #include <Notecard.h>               // Packages and transmits data through the Blues Notecard modem.
+#include "wiring_private.h"         // Exposes pinPeripheral() so pins 10/11 can be remapped to a SERCOM UART.
 
 // ---- 2. SETTINGS, HARDWARE ADDRESSES & TARGET FILE PATHS ----
-#define productUID "com.gmail.kaplan5393:envirotech_mini_met_station" // Your unique Notehub cloud project identifier.
-const uint8_t MUX_ADDR   = 0x70;           // Fixed I2C address of the DFRobot Gravity TCA9548A multiplexer.
-const uint8_t SHT_CH     = 0;              // Multiplexer channel wired to the SHT31 temp/RH probe.
+#include "secrets.h"                // Defines productUID (your Notehub product UID). Kept in a git-ignored file so your ID is never published; copy secrets.h.example to secrets.h to build.
+const uint8_t MUX_ADDR   = 0x71;           // Multiplexer address, moved off its 0x70 default (dial switch A0 set to "1") to avoid colliding with the SHTC3's fixed address.
+const uint8_t SHT_CH     = 0;              // Multiplexer channel wired to the SHTC3 temp/RH sensor.
 const uint8_t PRESS_CH   = 1;              // Multiplexer channel wired to the ICP10111 pressure sensor.
 const uint8_t RAIN_CH    = 2;              // Multiplexer channel wired to the SEN0575 rain gauge.
-const uint8_t SHT31_ADDR = 0x44;           // Fixed I2C address for the ambient air sensor (behind CH0).
+const uint8_t SHTC3_ADDR = 0x70;           // Fixed I2C address for the SHTC3 (hardwired in silicon, behind CH0).
 const uint8_t PRESS_ADDR = 0x63;           // Fixed I2C address for the barometric pressure chip (behind CH1).
 const uint8_t RAIN_ADDR  = 0x1D;           // Fixed I2C address for the rain gauge counter chip (behind CH2).
 #define SD_CS_PIN 4                        // Specifies digital pin 4 as the hardware chip select controller line for the SD card reader.
 static const size_t WAKE_PERIOD_S = 600;   // Sets a fixed 10-minute sleep duration (600 seconds) to maximize field battery preservation.
 
 // ---- 3. RUNTIME HARDWARE OBJECTS ----
-Adafruit_SHT31 sht31 = Adafruit_SHT31();            // Controls the SHT31 sensor interface.
+Adafruit_SHTC3 shtc3 = Adafruit_SHTC3();            // Controls the SHTC3 sensor interface.
 DFRobot_ICP10111 icp;                               // Controls the barometric pressure chip.
 DFRobot_RainfallSensor_I2C rainSensor(&Wire);       // Binds the rainfall sensor to the shared I2C bus.
 ModbusMaster solarNode;                             // Modbus engine for the RS485 solar meter.
 Notecard notecard;                                  // Master Notecard object for modem communications.
+
+// ---- SOFTWARE-DEFINED UART FOR RS485 (moved off hardware Serial1 to free pins 0/1 for the Notecard) ----
+Uart Serial2(&sercom1, 10, 11, SERCOM_RX_PAD_2, UART_TX_PAD_0); // Builds a second UART with RX on pin 10 and TX on pin 11 via SERCOM1.
+void SERCOM1_Handler() { Serial2.IrqHandler(); }                // Routes SERCOM1 hardware interrupts into the new Serial2 receive engine.
 
 // ---- 4. I2C MULTIPLEXER CHANNEL SELECT ----
 void tcaSelect(uint8_t channel) {
@@ -86,11 +92,11 @@ void setup() {
 
   Wire.begin(); // Spins up internal peripheral registers to establish the primary hardware I2C bus that reaches the multiplexer.
 
-  // ---- INITIALIZE CELLULAR NOTECARD MODEM (I2C MODE) ----
+  // ---- INITIALIZE CELLULAR NOTECARD MODEM (SERIAL MODE) ----
   Serial.print("Initializing Blues Wireless Notecard... "); // Logs intent to register and communicate with the modem module.
-  notecard.begin();                                         // Connects the processor to the Notecard over the shared I2C bus.
+  notecard.begin(Serial1, 9600);                            // Connects the processor to the Notecard over hardware Serial1 (pins 0/1) at 9600 baud.
   notecard.setDebugOutputStream(Serial);                    // Routes internal modem transmission logs to print directly to your monitor screen.
-  delay(50);                                                // Gives the link a moment to stabilize before the first command.
+  delay(50);                                                // Gives the serial link a moment to stabilize before the first command.
   Serial.println("✅ Online!");                             // Signals successful communication handshake with the cell module.
 
   // ---- CONFIGURE MODEM LOGIC & OUTBOUND ROUTING PATTERNS ----
@@ -101,7 +107,7 @@ void setup() {
     JAddNumberToObject(req, "outbound", 60); // Establishes your explicit 60-minute cloud data synchronization interval threshold.
     notecard.sendRequest(req); // Dispatches the completed settings command directly to the internal memory registers of the modem.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- OPTIMIZE CELLULAR POWER CHARGING VOLTAGES FOR LIPO CELLS ----
   {
@@ -109,7 +115,7 @@ void setup() {
     JAddStringToObject(req, "mode", "lipo"); // Commands the modem to calibrate its safety sensors specifically for standard Lithium Polymer cells.
     notecard.sendRequest(req); // Commits the power-saving charging parameters directly to the modem motherboard storage layers.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- ESTABLISH MASTER DATA TEMPLATE FOR cellular OPTIMIZATION ----
   // NOTE: template values are Blues TYPE INDICATORS, not sample data:
@@ -119,18 +125,18 @@ void setup() {
     JAddStringToObject(req, "file", "weather.qo"); // Assigns the structural footprint filter specifically to your target weather files.
     J * body = JAddObjectToObject(req, "body"); // Allocates a permanent structured nested data container inside the configuration object.
     JAddNumberToObject(body, "time_ms", 14);     // Declares uptime as a 4-byte signed integer field.
-    JAddNumberToObject(body, "sht31_t", 14.1);   // Declares air temperature as a 4-byte float field.
-    JAddNumberToObject(body, "sht31_h", 14.1);   // Declares air humidity as a 4-byte float field.
+    JAddNumberToObject(body, "sht31_t", 14.1);   // Declares air temperature as a 4-byte float field (now sourced from the SHTC3).
+    JAddNumberToObject(body, "sht31_h", 14.1);   // Declares air humidity as a 4-byte float field (now sourced from the SHTC3).
     JAddNumberToObject(body, "icp101_t", 14.1);  // Declares die temperature as a 4-byte float field.
     JAddNumberToObject(body, "icp101_p", 14.1);  // Declares barometric pressure as a 4-byte float field.
     JAddNumberToObject(body, "rain_mm", 14.1);   // Declares rain accumulation as a 4-byte float field.
     JAddNumberToObject(body, "solar_w", 12);     // Declares solar irradiance as a 2-byte signed integer field.
     notecard.sendRequest(req); // Commits the schema matrix down to the modem so it can squeeze data arrays into raw bitwise blocks.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- INITIALIZE DETACHED ARRAYS & STARTUP CHECKS ----
-  bool shtHardwareOK   = probeI2CDevice(SHT_CH, SHT31_ADDR, "SHT31 Temp/RH"); // Selects CH0 and wire-checks the air sensor.
+  bool shtHardwareOK   = probeI2CDevice(SHT_CH, SHTC3_ADDR, "SHTC3 Temp/RH"); // Selects CH0 and wire-checks the air sensor.
   delay(20); // Brief settle time between successive multiplexer channel switches.
   bool pressHardwareOK = probeI2CDevice(PRESS_CH, PRESS_ADDR, "ICP10111 Pressure"); // Selects CH1 and wire-checks the pressure chip.
   delay(20); // Brief settle time between successive multiplexer channel switches.
@@ -139,19 +145,25 @@ void setup() {
   bool sdHardwareOK    = SD.begin(SD_CS_PIN); // Checks if the SanDisk card is inserted and ready to accept raw data logs.
 
   // ---- VALIDATE AND LOAD MODULE SETTINGS ----
-  if (shtHardwareOK)   { tcaSelect(SHT_CH);   sht31.begin(SHT31_ADDR); delay(20); } // Reselects CH0 before configuring the air module.
+  if (shtHardwareOK) {
+    tcaSelect(SHT_CH);                        // Reselects CH0 before configuring the air module.
+    shtHardwareOK = shtc3.begin();            // Initializes the SHTC3 driver; folds the driver's own success check into the hardware-OK flag.
+    delay(20);                                // Settling delay after initialization.
+  }
   if (pressHardwareOK) {
-    tcaSelect(PRESS_CH);                    // Reselects CH1 before configuring the pressure module.
-    icp.begin();                            // Initializes the ICP10111 driver.
+    tcaSelect(PRESS_CH);                 // Reselects CH1 before configuring the pressure module.
+    icp.begin();                         // Initializes the ICP10111 driver.
     icp.setWorkPattern(icp.eUltraLowNoise); // Sets the high-resolution, low-noise measurement mode.
-    icp.getTemperature();                   // Throwaway priming read — discards the sensor's unreliable first conversion after mode config.
-    icp.getAirPressure();                   // Throwaway priming read — keeps the temp/pressure pair in sync before real data capture.
-    delay(20);                              // Settling delay after priming, before moving to the next module.
+    icp.getTemperature();                // Throwaway priming read — discards the sensor's unreliable first conversion after mode config.
+    icp.getAirPressure();                // Throwaway priming read — keeps the temp/pressure pair in sync before real data capture.
+    delay(20);                           // Settling delay after priming, before moving to the next module.
   }
   if (rainHardwareOK)  { tcaSelect(RAIN_CH);  rainSensor.begin(); rainSensor.setRainAccumulatedValue(0.2794); delay(20); } // Reselects CH2 before configuring rain.
 
-  Serial1.begin(4800);         // Opens the hardware UART on pins 0/1, now free for the solar reader since the Notecard runs over I2C.
-  solarNode.begin(2, Serial1); // Locks the Modbus engine to talk exclusively with components running on address Slave ID 2.
+  Serial2.begin(4800);           // Opens the new UART on pins 10/11 to accept incoming signals from your solar reader.
+  pinPeripheral(10, PIO_SERCOM); // Hands pin 10 over to SERCOM1 so it acts as the UART RX line.
+  pinPeripheral(11, PIO_SERCOM); // Hands pin 11 over to SERCOM1 so it acts as the UART TX line.
+  solarNode.begin(2, Serial2);   // Locks the Modbus engine to talk exclusively with components running on address Slave ID 2.
 
   // ---- SCAN SD DIRECTORIES AND BUILD TARGET DATA HEADERS ----
   if (sdHardwareOK) { // Enters the physical storage card check routine if internal initialization flags returned without error.
@@ -159,7 +171,7 @@ void setup() {
     if (!SD.exists("/MICMETST/DATA.CSV")) { // Screens the directory to verify if a master log file needs initialization.
       File dataFile = SD.open("/MICMETST/DATA.CSV", FILE_WRITE); // Generates a clean comma-separated document at the bottom sector space.
       if (dataFile) { // Verifies file access safety handles are locked in securely before committing file system strings.
-        dataFile.println("Timestamp(ms),SHT31_Temp(C),SHT31_Humidity(%),ICP10111_Temp(C),ICP10111_Pressure(hPa),SEN0575_Rain(mm),SEN0640_Solar(W/m2)"); // Writes out file system data labels.
+        dataFile.println("Timestamp(ms),SHTC3_Temp(C),SHTC3_Humidity(%),ICP10111_Temp(C),ICP10111_Pressure(hPa),SEN0575_Rain(mm),SEN0640_Solar(W/m2)"); // Writes out file system data labels.
         dataFile.close(); // Commits tracking array configurations directly to the card blocks and seals file resources.
       }
     }
@@ -171,14 +183,19 @@ void setup() {
   float sht_temp_C = 0.0, sht_hum_Perc = 0.0, icp_temp_C = 0.0, pressure_hPa = 0.0, totalRain_mm = 0.0; // Allocates decimal memory locations.
   uint16_t solar_Wm2 = 0; // Prepares an explicit integer variable space to store the positive incoming solar light energy values.
 
-  // 1. DATA HARVEST: SHT31 (multiplexer channel 0)
+  // 1. DATA HARVEST: SHTC3 (multiplexer channel 0)
   if (shtHardwareOK) { // Checks initial bus wire confirmation markers before dispatching data acquisition register tasks.
-    tcaSelect(SHT_CH); // Opens CH0 so the next I2C traffic reaches the SHT31.
+    tcaSelect(SHT_CH); // Opens CH0 so the next I2C traffic reaches the SHTC3.
+    sensors_event_t humidityEvent, tempEvent; // Holds the two Adafruit Unified Sensor event structs the SHTC3 driver fills in.
     for (uint8_t attempt = 0; attempt < 3 && !shtReadSuccess; attempt++) { // Retries up to 3 times to rule out a one-off CRC/timing glitch through the multiplexer channel.
-      sht_temp_C = sht31.readTemperature();  // Collects active ambient air temperature records from the external array casing.
-      sht_hum_Perc = sht31.readHumidity();   // Collects relative air moisture scaling data metrics from the external array casing.
-      if (!isnan(sht_temp_C) && !isnan(sht_hum_Perc)) { shtReadSuccess = true; } // Confirms raw sensor data calculations contain real numbers and passed CRC.
-      else { delay(30); } // Short pause before retrying a failed CRC/timing read.
+      bool eventOK = shtc3.getEvent(&humidityEvent, &tempEvent); // Triggers a fresh measurement and fills both events.
+      if (eventOK && !isnan(tempEvent.temperature) && !isnan(humidityEvent.relative_humidity)) { // Confirms the read succeeded and produced real numbers.
+        sht_temp_C = tempEvent.temperature;             // Copies the temperature reading out of the event struct.
+        sht_hum_Perc = humidityEvent.relative_humidity; // Copies the humidity reading out of the event struct.
+        shtReadSuccess = true;                          // Marks this cycle's air reading as valid.
+      } else {
+        delay(30); // Short pause before retrying a failed read.
+      }
     }
   }
   delay(50); // Settling delay before switching to the next sensor's channel.
@@ -208,7 +225,7 @@ void setup() {
 
   // ---- LOCAL MONITOR RECONSTRUCTED LOG PRINTING OUT ----
   Serial.print("MONITOR LOG -> "); Serial.print(currentMillis); Serial.print(", "); // Starts a new comma-separated screen stream entry row.
-  if (shtReadSuccess)   { Serial.print(sht_temp_C); Serial.print(" C, "); Serial.print(sht_hum_Perc); Serial.print(" %, "); } else { Serial.print("ERR, ERR, "); } // Prints SHT31 screen strings.
+  if (shtReadSuccess)   { Serial.print(sht_temp_C); Serial.print(" C, "); Serial.print(sht_hum_Perc); Serial.print(" %, "); } else { Serial.print("ERR, ERR, "); } // Prints SHTC3 screen strings.
   if (pressReadSuccess) { Serial.print(icp_temp_C); Serial.print(" C, "); Serial.print(pressure_hPa); Serial.print(" hPa, "); } else { Serial.print("ERR, ERR, "); } // Prints ICP screen strings.
   if (rainReadSuccess)  { Serial.print(totalRain_mm, 4); Serial.print(" mm, "); } else { Serial.print("ERR, "); } // Prints precipitation values.
   if (solarReadSuccess) { Serial.print(solar_Wm2); Serial.println(" W/m2"); } else { Serial.println("ERR"); } // Prints solar values and finishes row.
@@ -218,7 +235,7 @@ void setup() {
     File dataFile = SD.open("/MICMETST/DATA.CSV", FILE_WRITE); // Activates the direct shortened file path channel and jumps to bottom.
     if (dataFile) { // Verifies file stream initialization succeeded before transmitting data rows over SPI copper channels.
       dataFile.print(currentMillis); dataFile.print(","); // Commits system lifetime markers as the key indexing point for database software.
-      if (shtReadSuccess)   { dataFile.print(sht_temp_C); dataFile.print(","); dataFile.print(sht_hum_Perc); dataFile.print(","); } else { dataFile.print("ERR,ERR,"); } // Commits SHT records.
+      if (shtReadSuccess)   { dataFile.print(sht_temp_C); dataFile.print(","); dataFile.print(sht_hum_Perc); dataFile.print(","); } else { dataFile.print("ERR,ERR,"); } // Commits SHTC3 records.
       if (pressReadSuccess) { dataFile.print(icp_temp_C); dataFile.print(","); dataFile.print(pressure_hPa); dataFile.print(","); } else { dataFile.print("ERR,ERR,"); } // Commits pressure records.
       if (rainReadSuccess)  { dataFile.print(totalRain_mm, 4); dataFile.print(","); } else { dataFile.print("ERR,"); } // Commits precipitation decimals.
       if (solarReadSuccess) { dataFile.println(solar_Wm2); } else { dataFile.println("ERR"); } // Commits solar values and issues row jump commands.
@@ -233,7 +250,7 @@ void setup() {
     J * body = JAddObjectToObject(req, "body"); // Integrates a clean nested data tracking layer inside the root transaction packet.
     if (body != NULL) { // Shields downstream assignments from memory failures if object properties generated errors.
       JAddNumberToObject(body, "time_ms", currentMillis); // Populates the data row object with current system uptime records.
-      if (shtReadSuccess)   { JAddNumberToObject(body, "sht31_t",  sht_temp_C); JAddNumberToObject(body, "sht31_h",  sht_hum_Perc); } // Bundles air data.
+      if (shtReadSuccess)   { JAddNumberToObject(body, "sht31_t",  sht_temp_C); JAddNumberToObject(body, "sht31_h",  sht_hum_Perc); } // Bundles air data (now from the SHTC3).
       if (pressReadSuccess) { JAddNumberToObject(body, "icp101_t", icp_temp_C); JAddNumberToObject(body, "icp101_p", pressure_hPa); } // Bundles baro metrics.
       if (rainReadSuccess)  { JAddNumberToObject(body, "rain_mm",  totalRain_mm); } // Adds rain gauge data to payload package — 0 is a valid value here.
       if (solarReadSuccess) { JAddNumberToObject(body, "solar_w",  solar_Wm2); } // Adds solar readings to payload package — 0 is a valid value here.
@@ -241,7 +258,7 @@ void setup() {
     notecard.sendRequest(req); // Commits the structured record straight down to the cellular modem's non-volatile local database.
     Serial.println("📡 Data package safely queued inside Notecard local storage cache!"); // Logs process confirmation to monitor.
   }
-  delay(50); // Lets the modem finish processing before the sleep command.
+  delay(50); // Lets the serial-mode modem finish processing before the sleep command.
 
   // ---- TOTAL POWER SHUTDOWN ENFORCEMENT & HARDWARE SLEEP COMMAND ----
   Serial.println("💤 Execution complete. Requesting 10-minute total hardware power-down from Notecard ATTN..."); // Logs status.
