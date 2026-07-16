@@ -25,6 +25,7 @@ The Arduino firmware is included here. The full project report is provided in th
 - **dashboard generator code** — pulls station + IMS reference data via API and generates the comparison dashboard (see [Dashboard & Validation](#dashboard--validation) below)
 - `BILL_OF_MATERIALS.md` — full parts list with costs, links, and specs
 - **Final project report** — covers Literature Review, Materials & Methods, Results & Discussion, Challenges & Considerations, and Conclusions
+- **Final project presentation**
 
 ## At a Glance
 | | |
