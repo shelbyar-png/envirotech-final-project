@@ -6,6 +6,8 @@ The system is **solar powered**, running on a solar panel and rechargeable batte
 
 **Measured parameters:** air temperature & humidity, barometric pressure, rainfall, and solar radiation.
 
+A companion Python script pulls the station's data from Notehub and cross-validates it against official Israel Meteorological Service (IMS) reference stations, generating a "nearly-live" comparison dashboard with publication-ready exportable charts.
+
 ## About
 This project was developed for the graduate-level course **"Envirotech: DIY Sensors for Environmental Research"** taught by **Prof. Elad Levintal** at **Ben-Gurion University of the Negev**.
 
