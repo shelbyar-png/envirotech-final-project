@@ -20,7 +20,7 @@ The Arduino firmware is included here. The full project report is provided in th
 
 - **Bill of Materials**
 - **Arduino IDE code**
-- **Dashboard generator code*
+- **Dashboard generator code**
 - **Full project report**
 
 ## At a Glance
