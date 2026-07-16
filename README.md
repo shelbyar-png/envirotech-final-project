@@ -19,10 +19,9 @@ This project was developed for the graduate-level course **"Envirotech: DIY Sens
 The Arduino firmware is included here. The full project report is provided in this repository and covers:
 
 - **Bill of Materials**
-- **Wiring Diagram**
-- **Literature Review**
-- **Results and Discussion**
-- **Conclusion**
+- **Arduino IDE code**
+- **Dashboard generator code*
+- **Full project report**
 
 ## At a Glance
 | | |
