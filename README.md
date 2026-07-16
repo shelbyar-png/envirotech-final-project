@@ -39,7 +39,7 @@ The Arduino firmware is included here. The full project report is provided in th
 | **Validation** | Live-compared against IMS Sde Boker & Ashalim reference stations |
 
 ## Dashboard & Validation
-`station_dashboard.py` pulls the station's readings from the Notehub API and overlays reference data from IMS's Sde Boker (~1 km away) and Ashalim (~15 km away) stations for the same period, producing an interactive HTML dashboard with per-chart PNG export.
+`dashboard generator code` pulls the station's readings from the Notehub API and overlays reference data from IMS's Sde Boker (~1 km away) and Ashalim (~15 km away) stations for the same period, producing an interactive HTML dashboard with per-chart PNG export.
 
 **Setup:**
 1. Create a Notehub Personal Access Token (Notehub → account menu → Settings → Personal Access Tokens).
