@@ -18,20 +18,36 @@ This project was developed for the graduate-level course **"Envirotech: DIY Sens
 ## Repository Contents
 The Arduino firmware is included here. The full project report is provided in this repository and covers:
 
-- **Bill of Materials**
-- **Arduino IDE code**
-- **Dashboard generator code**
-- **Full project report**
+## Repository Contents
+- **Arduino firmware**, plus `secrets.h.example` (copy to `secrets.h` and add your own Notehub product UID before building — this file is git-ignored)
+- **dashboard generator code** — pulls station + IMS reference data via API and generates the comparison dashboard (see [Dashboard & Validation](#dashboard--validation) below)
+- `BILL_OF_MATERIALS.md` — full parts list with costs, links, and specs
+- **Final project report** — covers Literature Review, Materials & Methods, Results & Discussion, Challenges & Considerations, and Conclusions
 
 ## At a Glance
 | | |
 |---|---|
 | **Microcontroller** | Adafruit Feather M0 Adalogger |
-| **Sensors** | SHT31 (temp/RH), ICP10111 (pressure), SEN0575 (rain), RS485 (solar sensor) |
-| **Connectivity** | Blues Wireless Notecard (cellular) |
-| **Power** | Solar panel + rechargeable battery |
+| **Sensors** | SHT31 (temp/RH), ICP10111 (pressure), SEN0575 (rain), SEN0640 RS485 (solar radiation) |
+| **Sensor bus** | DFRobot Gravity I²C multiplexer (TCA9548A), avoids bus contention with the Notecard |
+| **Connectivity** | Blues Wireless Notecard (cellular, I²C mode) |
+| **Power** | Solar panel + rechargeable Li-ion battery |
 | **Storage** | microSD (local CSV backup) |
-| **Power strategy** | 10-minute power-gated wake cycles; 60-minute cloud sync |
+| **Power strategy** | 10-minute power-gated wake cycles (full hardware power cutoff via Notecard ATTN); 60-minute cloud sync |
+| **Validation** | Live-compared against IMS Sde Boker & Ashalim reference stations |
+
+## Dashboard & Validation
+`station_dashboard.py` pulls the station's readings from the Notehub API and overlays reference data from IMS's Sde Boker (~1 km away) and Ashalim (~15 km away) stations for the same period, producing an interactive HTML dashboard with per-chart PNG export.
+
+**Setup:**
+1. Create a Notehub Personal Access Token (Notehub → account menu → Settings → Personal Access Tokens).
+2. (Optional, for IMS comparison) Request an IMS API token at ims@ims.gov.il — see the [IMS Observation Data API](https://ims.gov.il/en/ObservationDataAPI).
+3. Create `notehub_secret.txt` next to the script (git-ignored) with:
+NOTEHUB_TOKEN=your_token
+NOTEHUB_PROJECT_UID=com.your-namespace:your_project
+IMS_TOKEN=your_ims_token
+
+4. Run `python3 station_dashboard.py` — writes `dashboard.html` and opens it in your browser. Re-run any time to refresh.
 
 ## Disclaimer
 This project is shared for educational and reference purposes. It reflects the specific components, wiring, and environmental conditions used in our build. Any variations to the hardware, sensors, power setup, code, or deployment conditions may produce different results and performance. If you adapt this design, test thoroughly and proceed at your own risk.
