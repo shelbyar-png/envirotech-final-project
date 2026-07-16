@@ -12,8 +12,8 @@ This project was developed for the graduate-level course **"Envirotech: DIY Sens
 ## Group Members
 - Shelby Kaplan
 - Rut Parnas
-- Mary Mitchell Adhiambo
 - Ramson Kabenla
+- Mary Mitchell Adhiambo
 
 ## Repository Contents
 The Arduino firmware is included here. The full project report is provided in this repository and covers:
