@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+"""
+Envirotech Mini Met Station -- local live dashboard generator
+=============================================================
+Pulls weather.qo events from your Blues Notehub project and writes a single
+self-contained dashboard.html (charts + latest readings). Re-run any time to
+refresh with the newest data.
+
+SETUP (one time):
+  1. Create a Notehub Personal Access Token:
+       Notehub -> account menu (top-right) -> Settings -> Personal Access Tokens
+       -> create one, copy it.
+  2. Create notehub_secret.txt beside this script (git-ignored) with:
+       NOTEHUB_TOKEN=your_token
+       NOTEHUB_PROJECT_UID=com.your-namespace:your_project
+       IMS_TOKEN=your_ims_token   (optional, enables the IMS reference overlay)
+
+RUN:
+  python3 station_dashboard.py
+  -> writes dashboard.html and opens it in your browser.
+
+No external libraries needed -- Python 3 standard library only.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.parse
+import urllib.error
+import webbrowser
+from datetime import datetime, timezone, timedelta
+
+
+# =============================== SECRETS LOADER ==================================
+# Reads tokens/UIDs from environment variables first, then falls back to a
+# git-ignored notehub_secret.txt (KEY=value lines) sitting next to this script.
+# Nothing identifying ever lives in this .py file, so it's safe to commit to GitHub.
+_SECRET_CACHE = None
+
+
+def _secret(key, default=""):
+    """Read a value from env var KEY, else from the untracked notehub_secret.txt (KEY=value lines)."""
+    v = os.environ.get(key, "").strip()
+    if v:
+        return v
+    global _SECRET_CACHE
+    if _SECRET_CACHE is None:
+        _SECRET_CACHE = {}
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notehub_secret.txt")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, _, val = line.partition("=")   # partition on first "=" (token contains "=")
+                    _SECRET_CACHE[k.strip()] = val.strip()
+    return _SECRET_CACHE.get(key, default)
+
+
+# =============================== CONFIG -- EDIT THESE =============================
+PROJECT_UID  = _secret("NOTEHUB_PROJECT_UID")
+TOKEN        = _secret("NOTEHUB_TOKEN")
+NOTEFILE     = "weather.qo"     # which Notefile to chart
+MAX_EVENTS   = 1000             # how many of the most recent readings to pull
+START_LOCAL  = "2026-07-13 13:25"  # only include readings at/after this local time; "" = all
+OUT_PATH     = "dashboard.html" # output file (written next to this script)
+OPEN_BROWSER = True             # auto-open the dashboard after generating
+# ===================================================================================
+
+# Metrics that are 0 (not missing) when absent: dry rain gauge / dark solar sensor.
+ZERO_FILL = ("rain_mm", "solar_w")
+
+BASE = "https://api.notefile.net"
+PAGE_SIZE = 100
+
+METRIC_KEYS = ["sht31_t", "sht31_h", "icp101_t", "icp101_p", "rain_mm", "solar_w"]
+
+# =============================== IMS REFERENCE DATA (optional) ====================
+# Overlays Israel Meteorological Service data for the same period, for comparison.
+# Token from notehub_secret.txt / env var IMS_TOKEN (request one at ims@ims.gov.il,
+# see https://ims.gov.il/en/ObservationDataAPI). If absent, the overlay is skipped.
+IMS_TOKEN = _secret("IMS_TOKEN")
+IMS_BASE = "https://api.ims.gov.il/v1/envista"
+
+# IMS's own API docs state observation timestamps are always Israel STANDARD time
+# (UTC+2) year-round, even though the API mislabels them "+03:00" in summer -- so
+# that suffix must be stripped and replaced with the real +02:00 offset, or every
+# point lands an hour off from the station's true UTC-synced Notecard timestamps.
+IMS_TZ = timezone(timedelta(hours=2))
+
+# Sde Boker has no solar-radiation or pressure sensor; Ashalim (~15 km away) is the
+# nearest active IMS station with both, at the same 10-minute resolution.
+IMS_STATIONS = {
+    "sde_boker": {"id": 98, "channels": {"td": 7, "rh": 8, "rain": 1}},
+    "ashalim":   {"id": 381, "channels": {"grad": 14, "bp": 18}},
+}
+
+
+def fetch_ims_channel(station_id, channel_id, date_from, date_to):
+    """Pull one IMS channel over a date range. Returns [(epoch_utc, value), ...]."""
+    url = f"{IMS_BASE}/stations/{station_id}/data/{channel_id}?from={date_from}&to={date_to}"
+    req = urllib.request.Request(url, headers={"Authorization": f"ApiToken {IMS_TOKEN}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.load(resp)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        print(f"  WARNING: IMS fetch failed (station {station_id}, channel {channel_id}): {e}")
+        return []
+    out = []
+    for row in payload.get("data", []):
+        try:
+            naive = datetime.strptime(row.get("datetime", "")[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        epoch = naive.replace(tzinfo=IMS_TZ).timestamp()  # corrected UTC+2, not the mislabeled +03:00
+        for ch in row.get("channels", []):
+            if ch.get("id") == channel_id and ch.get("valid") and ch.get("value") is not None:
+                out.append((epoch, ch["value"]))
+    return out
+
+
+def fetch_ims_all(rows):
+    """Fetch IMS reference series spanning the same period as `rows`. None if no token/data."""
+    if not IMS_TOKEN or not rows:
+        return None
+    first_local = datetime.fromtimestamp(rows[0]["t"]).astimezone()
+    last_local = datetime.fromtimestamp(rows[-1]["t"]).astimezone()
+    date_from = (first_local - timedelta(days=1)).strftime("%Y/%m/%d")  # 1-day pad absorbs
+    date_to = (last_local + timedelta(days=1)).strftime("%Y/%m/%d")     # the tz correction at day edges
+
+    print(f"Fetching IMS reference data ({date_from} to {date_to}) ...")
+    series = {}
+    for station_key, cfg in IMS_STATIONS.items():
+        for chan_key, chan_id in cfg["channels"].items():
+            pts = fetch_ims_channel(cfg["id"], chan_id, date_from, date_to)
+            series[f"{station_key}_{chan_key}"] = [{"t": t, "v": v} for t, v in pts]
+
+    # IMS "Rain" is rainfall accumulated per 10-minute interval, not a running total;
+    # sum it into a cumulative series to compare against the gauge's cumulative reading.
+    total, cum = 0.0, []
+    for p in sorted(series.get("sde_boker_rain", []), key=lambda p: p["t"]):
+        total += p["v"]
+        cum.append({"t": p["t"], "v": round(total, 3)})
+    series["sde_boker_rain_cum"] = cum
+
+    print(f"Got {sum(len(v) for v in series.values())} IMS reference points.")
+    return series
+
+
+# =============================== NOTEHUB FETCH =====================================
+def fetch_events():
+    """Pull the most recent events for NOTEFILE, newest first, across pages."""
+    collected = []
+    page = 1
+    while len(collected) < MAX_EVENTS:
+        query = urllib.parse.urlencode({
+            "pageSize": PAGE_SIZE,
+            "pageNum": page,
+            "sortBy": "captured",
+            "sortOrder": "desc",   # newest first
+            "files": NOTEFILE,
+        })
+        url = f"{BASE}/v1/projects/{PROJECT_UID}/events?{query}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = json.load(resp)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            print(f"ERROR: HTTP {e.code} from Notehub.\n{body}")
+            if e.code in (401, 403):
+                print("\nCheck that your TOKEN is valid and PROJECT_UID is correct.")
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"ERROR: could not reach Notehub ({e.reason}). Check your internet.")
+            sys.exit(1)
+
+        batch = payload.get("events", payload if isinstance(payload, list) else [])
+        if not batch:
+            break
+        collected.extend(batch)
+        if len(batch) < PAGE_SIZE:
+            break
+        page += 1
+
+    return collected[:MAX_EVENTS]
+
+
+def start_epoch():
+    """Convert START_LOCAL (interpreted in the computer's local timezone) to epoch seconds."""
+    if not START_LOCAL:
+        return None
+    dt = datetime.strptime(START_LOCAL, "%Y-%m-%d %H:%M").astimezone()
+    return dt.timestamp()
+
+
+def to_rows(events):
+    """Flatten events into chart rows, oldest -> newest, dropping empty bodies."""
+    cutoff = start_epoch()
+    rows = []
+    for e in events:
+        when = e.get("when")
+        body = e.get("body") or {}
+        if when is None:
+            continue
+        if cutoff is not None and when < cutoff:
+            continue  # before the requested start time
+        vals = {k: body.get(k) for k in METRIC_KEYS}
+        if all(v is None for v in vals.values()):
+            continue  # skip the empty "{}" notes
+        for k in ZERO_FILL:          # a real reading with no rain/solar means 0, not missing
+            if vals[k] is None:
+                vals[k] = 0
+        row = {"t": when}
+        row.update(vals)
+        rows.append(row)
+    rows.sort(key=lambda r: r["t"])   # chronological for plotting (by capture time)
+    return rows
+
+
+# =============================== HTML/JS TEMPLATE ==================================
+def build_html(rows, ims_series=None):
+    meta = {
+        "station": "Envirotech Mini Met Station",
+        "generated": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M"),
+        "count": len(rows),
+        "first": rows[0]["t"] if rows else None,
+        "last": rows[-1]["t"] if rows else None,
+    }
+    return (TEMPLATE
+            .replace("__DATA__", json.dumps(rows))
+            .replace("__META__", json.dumps(meta))
+            .replace("__IMS__", json.dumps(ims_series or {})))
+
+
+TEMPLATE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Envirotech Mini Met Station</title>
+<style>
+  /* ---- page chrome: header, stat tiles, chart cards ---- */
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#eef1f5; color:#1a1a1a; font-family:Arial, Helvetica, sans-serif; }
+  header{ padding:26px 24px 4px; max-width:1180px; margin:0 auto; }
+  h1{ margin:0 0 4px; font-size:22px; }
+  .sub{ color:#5a6472; font-size:13px; }
+  main{ max-width:1180px; margin:0 auto; padding:16px 24px 48px; }
+  .tiles{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin:16px 0 24px; }
+  .tile{ background:#fff; border:1px solid #dfe3e8; border-radius:10px; padding:14px 16px; }
+  .tile .lab{ font-size:11px; text-transform:uppercase; letter-spacing:.05em; color:#5a6472; }
+  .tile .val{ font-size:24px; font-weight:700; margin-top:4px; }
+  .tile .val small{ font-size:13px; font-weight:500; color:#5a6472; }
+  .charts{ display:grid; grid-template-columns:repeat(auto-fit,minmax(440px,1fr)); gap:16px; }
+  .card{ background:#fff; border:1px solid #dfe3e8; border-radius:10px; padding:12px 14px 10px; }
+  .card .head{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:2px; }
+  .card h3{ margin:0; font-size:14px; font-weight:700; }
+  .card .cur{ color:#5a6472; font-size:12px; margin:0 0 4px; }
+  .btns{ display:flex; gap:6px; flex:none; }
+  .btns button{ font:500 11px Arial,Helvetica,sans-serif; color:#33404d; background:#f2f4f7;
+        border:1px solid #d3d9e0; border-radius:6px; padding:3px 9px; cursor:pointer; }
+  .btns button:hover{ background:#e7ebf0; }
+  svg{ width:100%; height:auto; display:block; }
+  .empty{ color:#5a6472; font-size:13px; padding:24px 0 32px; text-align:center; }
+  #tip{ position:fixed; display:none; pointer-events:none; z-index:10;
+        background:#1a1a1a; color:#fff; font-size:12px; line-height:1.35;
+        padding:6px 9px; border-radius:7px; box-shadow:0 4px 14px rgba(0,0,0,.25); }
+  #toast{ position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
+        background:#1a1a1a; color:#fff; font-size:13px; padding:9px 16px; border-radius:8px;
+        opacity:0; transition:opacity .2s; pointer-events:none; z-index:20; }
+  footer{ max-width:1180px; margin:0 auto; padding:0 24px 40px; color:#5a6472; font-size:12px; line-height:1.6; }
+  footer a{ color:#3d5a80; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Envirotech Mini Met Station</h1>
+  <div class="sub" id="sub"></div>
+</header>
+<main>
+  <div class="tiles" id="tiles"></div>
+  <div class="charts" id="charts"></div>
+</main>
+<footer id="footer"></footer>
+<div id="tip"></div>
+<div id="toast"></div>
+
+<script>
+// ---- data injected by the Python script at generation time ----
+const DATA = __DATA__;   // this station's own sensor readings, sorted chronologically
+const META = __META__;   // summary info: reading count, date range, generated-at time
+const IMS = __IMS__;     // IMS reference series, keyed by e.g. "sde_boker_td", "ashalim_bp"
+const SVGNS = 'http://www.w3.org/2000/svg';
+const XAXIS_TITLE = 'Date & time (IDT)';
+
+// Styles are embedded INSIDE each <svg> (not just the page <style> above) so that
+// exported PNGs are fully self-contained and render correctly outside the browser.
+const SVGCSS = ".bg{fill:#ffffff}.grid{stroke:#e8e8e8;stroke-width:1}"
+  +".dayline{stroke:#cfcfcf;stroke-width:1;stroke-dasharray:3 3}"
+  +".axis{stroke:#333;stroke-width:1.2}.tick{stroke:#555;stroke-width:1}"
+  +".tlab{fill:#333;font:11px Arial,Helvetica,sans-serif}.ytl{text-anchor:end}.xtl{text-anchor:middle}"
+  +".daylab{fill:#111;font:700 12px Arial,Helvetica,sans-serif;text-anchor:middle}"
+  +".axtitle{fill:#111;font:700 13px Arial,Helvetica,sans-serif;text-anchor:middle}"
+  +".pklab{font:10px Arial,Helvetica,sans-serif;text-anchor:middle}"
+  +".leg{font:12px Arial,Helvetica,sans-serif;fill:#111}";
+
+// ---- top-of-page stat tiles: one per raw metric, showing the latest value ----
+const TILES = [
+  {key:'sht31_t',  label:'Air Temperature',      unit:'°C'},
+  {key:'sht31_h',  label:'Relative Humidity',    unit:'%'},
+  {key:'icp101_p', label:'Barometric Pressure',  unit:'hPa'},
+  {key:'icp101_t', label:'Temp (pressure sensor)', unit:'°C'},
+  {key:'solar_w',  label:'Solar Radiation',      unit:'W/m²'},
+  {key:'rain_mm',  label:'Rainfall (latest reading)',unit:'mm'},
+];
+
+// Okabe-Ito colorblind-safe palette. IMS reference lines are always the same
+// neutral grey + dashed, everywhere -- so grey-dashed reads as "IMS (different
+// source/location)" at a glance, consistently across every chart.
+const IMS_COLOR = '#767676';
+const C = { blue:'#0072B2', vermillion:'#D55E00', green:'#009E73', orange:'#E69F00',
+            purple:'#CC79A7', sky:'#56B4E9' };
+
+// ---- chart definitions: each entry becomes one card with one or more series ----
+// Distance notes: "~1 km" = IMS Sde Boker station to the Zuckerberg Institute for
+// Water Research (BGU Sde Boker campus), computed from published coordinates --
+// the station is effectively on the research campus itself. "~15 km" = Ashalim,
+// the nearest IMS station that also carries solar/pressure sensors.
+const CHARTS = [
+  {slug:'temperature', title:'Temperature Comparison', ylabel:'Temperature (°C)', unit:'°C', series:[
+     {key:'sht31_t',  label:'Temp/humidity sensor (SHT31)',    color:C.blue},
+     {key:'icp101_t', label:'Pressure/temp sensor (ICP10111)', color:C.vermillion},
+     {points:'sde_boker_td', label:'IMS Sde Boker (~1 km)', color:IMS_COLOR, dash:true, noPeaks:true}]},
+  {slug:'humidity', title:'Relative Humidity', ylabel:'Relative humidity (%)', unit:'%', series:[
+     {key:'sht31_h', label:'SHT31', color:C.green},
+     {points:'sde_boker_rh', label:'IMS Sde Boker (~1 km)', color:IMS_COLOR, dash:true, noPeaks:true}]},
+  {slug:'pressure', title:'Barometric Pressure', ylabel:'Barometric pressure (hPa)', unit:'hPa', series:[
+     {key:'icp101_p', label:'ICP10111', color:C.sky},
+     {points:'ashalim_bp', label:'IMS Ashalim (~15 km)', color:IMS_COLOR, dash:true, noPeaks:true}]},
+  {slug:'solar', title:'Solar Radiation', ylabel:'Solar irradiance (W m⁻²)', unit:'W m⁻²', minZero:true, series:[
+     {key:'solar_w', label:'SEN0640', color:C.orange},
+     {points:'ashalim_grad', label:'IMS Ashalim (~15 km)', color:IMS_COLOR, dash:true, noPeaks:true}]},
+  {slug:'rainfall', title:'Rainfall', ylabel:'Rainfall (mm)', unit:'mm', minZero:true, series:[
+     {key:'rain_mm', label:'SEN0575', color:C.purple},
+     {points:'sde_boker_rain_cum', label:'IMS Sde Boker (~1 km, cumulative)', color:IMS_COLOR, dash:true, noPeaks:true}]},
+];
+
+// ---- small shared helpers: date/time formatting, value validity check, toasts ----
+const tip = document.getElementById('tip');
+const toastEl = document.getElementById('toast');
+const fmtFull = t => new Date(t*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+const fmtDay  = t => new Date(t*1000).toLocaleDateString([], {month:'short',day:'numeric'});
+const fmtHM   = t => new Date(t*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+const localMidnight = t => { const d=new Date(t*1000); d.setHours(0,0,0,0); return d.getTime()/1000; };
+const valid = v => v!==null && v!==undefined && !isNaN(v);
+function toast(msg){ toastEl.textContent=msg; toastEl.style.opacity='1'; setTimeout(()=>toastEl.style.opacity='0',1600); }
+
+function lastVal(key){
+  for(let i=DATA.length-1;i>=0;i--){ if(valid(DATA[i][key])) return {v:DATA[i][key], t:DATA[i].t}; }
+  return null;
+}
+
+// ==================== SECTION: header subtitle + stat tiles ====================
+(function(){
+  const sub=document.getElementById('sub');
+  if(META.count===0){ sub.textContent='No readings found for this Notefile in the selected range.'; return; }
+  sub.textContent = META.count+' readings · '+fmtFull(META.first)+' → '+fmtFull(META.last)+' · generated '+META.generated;
+  const tiles=document.getElementById('tiles');
+  TILES.forEach(m=>{
+    const lv=lastVal(m.key);
+    const el=document.createElement('div'); el.className='tile';
+    el.innerHTML='<div class="lab">'+m.label+'</div>'+
+      '<div class="val">'+(lv? lv.v.toFixed(1)+' <small>'+m.unit+'</small>':'—')+'</div>';
+    tiles.appendChild(el);
+  });
+})();
+
+// ==================== SECTION: chart-building helpers ====================
+function peakLabel(x,y,color,txt,dir){
+  const dy = dir==='up' ? -7 : 15;
+  return '<circle cx="'+x+'" cy="'+y+'" r="3" fill="none" stroke="'+color+'" stroke-width="1.5"/>'+
+         '<text class="pklab" x="'+x+'" y="'+(y+dy)+'" fill="'+color+'">'+txt+'</text>';
+}
+
+// "Nice" axis step (1/2/5 * 10^n) so gridlines land on round numbers instead of
+// arbitrary fractions -- the classic d3/matplotlib-style tick algorithm.
+function niceStep(range, targetTicks){
+  if(!(range>0)) return 1;
+  const rough = range/targetTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  const norm = rough/mag;
+  const niceNorm = norm<1.5 ? 1 : norm<3 ? 2 : norm<7 ? 5 : 10;
+  return niceNorm*mag;
+}
+function decimalsFor(step){
+  const s = String(step);
+  return s.indexOf('.')===-1 ? 0 : s.split('.')[1].length;
+}
+
+// ==================== SECTION: build one chart's SVG ====================
+// Returns everything EXCEPT the descriptive title, which lives in HTML and is
+// left out of exports so it can serve as the figure caption instead.
+function buildSVG(cfg){
+  const tMin=DATA[0].t, tMax=DATA[DATA.length-1].t;
+
+  // pull each series' raw points -- either from our own DATA array, or (for
+  // IMS reference series) from the IMS object under the given key
+  const sp = cfg.series.map(s=>{
+    const raw = s.points
+      ? (IMS[s.points]||[])
+      : DATA.map(d=>({t:d.t,v:d[s.key]}));
+    // clip to the station's own time window so reference series (fetched with a
+    // padding buffer) never draws past the left/right edge of the x-axis.
+    const pts = raw.filter(p=>valid(p.v) && p.t>=tMin && p.t<=tMax);
+    return {s, pts};
+  });
+  if(!sp.some(x=>x.pts.length)) return null;
+  const multi = cfg.series.length>1;
+  const W=840,H=470, m={l:78,r:22,t:(multi?42:20),b:80};
+
+  // compute the data's min/max across all series on this chart
+  let vals=[]; sp.forEach(x=>x.pts.forEach(p=>vals.push(p.v)));
+  let dataMin=Math.min(...vals), dataMax=Math.max(...vals);
+  if(dataMin===dataMax){ dataMin-=1; dataMax+=1; }
+
+  // Nice, round-number axis bounds. Charts whose values are physically >=0
+  // (solar irradiance, rainfall) are floored at exactly 0 -- never padded
+  // into negative numbers -- while still getting a nicely-stepped top bound.
+  let vMin, vMax, step;
+  if(cfg.minZero){
+    const topPad = dataMax*0.12 || 1;
+    step = niceStep(dataMax+topPad, 5);
+    vMin = 0;
+    vMax = Math.max(step, Math.ceil((dataMax+topPad)/step)*step);
+  } else {
+    const pad=(dataMax-dataMin)*0.12;
+    step = niceStep((dataMax+pad)-(dataMin-pad), 5);
+    vMin = Math.floor((dataMin-pad)/step)*step;
+    vMax = Math.ceil((dataMax+pad)/step)*step;
+  }
+  const decimals = decimalsFor(step);
+  const X=t=> m.l + (tMax===tMin?0:(t-tMin)/(tMax-tMin))*(W-m.l-m.r);
+  const Y=v=> m.t + (1-(v-vMin)/(vMax-vMin))*(H-m.t-m.b);
+  const pB=H-m.b, pR=W-m.r;
+
+  let s='<rect class="bg" x="0" y="0" width="'+W+'" height="'+H+'"/>';
+
+  // -- horizontal gridlines, y-axis ticks and labels, at nice round-number steps --
+  const nTicks = Math.round((vMax-vMin)/step);
+  for(let i=0;i<=nTicks;i++){ const val=vMin+i*step, y=Y(val);
+    s+='<line class="grid" x1="'+m.l+'" y1="'+y+'" x2="'+pR+'" y2="'+y+'"/>'+
+       '<line class="tick" x1="'+(m.l-4)+'" y1="'+y+'" x2="'+m.l+'" y2="'+y+'"/>'+
+       '<text class="tlab ytl" x="'+(m.l-8)+'" y="'+(y+3.5)+'">'+val.toFixed(decimals)+'</text>'; }
+
+  // -- day separators (dashed vertical lines) + centered day labels --
+  let bounds=[tMin]; let mid=localMidnight(tMin)+86400;
+  while(mid<tMax){ bounds.push(mid); mid+=86400; } bounds.push(tMax);
+  for(let i=1;i<bounds.length-1;i++){ const x=X(bounds[i]); s+='<line class="dayline" x1="'+x+'" y1="'+m.t+'" x2="'+x+'" y2="'+pB+'"/>'; }
+  for(let i=0;i<bounds.length-1;i++){ const cx=X((bounds[i]+bounds[i+1])/2); s+='<text class="daylab" x="'+cx+'" y="'+(pB+52)+'">'+fmtDay((bounds[i]+bounds[i+1])/2)+'</text>'; }
+
+  // -- 6-hour ticks + clock labels, so sunrise/noon/sundown are readable on the axis --
+  let day=localMidnight(tMin);
+  while(day<=tMax){ [6,12,18].forEach(h=>{ const tt=day+h*3600; if(tt>=tMin&&tt<=tMax){ const x=X(tt);
+        s+='<line class="tick" x1="'+x+'" y1="'+pB+'" x2="'+x+'" y2="'+(pB+5)+'"/>'+
+           '<text class="tlab xtl" x="'+x+'" y="'+(pB+18)+'">'+String(h).padStart(2,'0')+':00</text>'; } }); day+=86400; }
+
+  // -- axis lines + rotated y-axis title + x-axis title --
+  s+='<line class="axis" x1="'+m.l+'" y1="'+m.t+'" x2="'+m.l+'" y2="'+pB+'"/>'+
+     '<line class="axis" x1="'+m.l+'" y1="'+pB+'" x2="'+pR+'" y2="'+pB+'"/>';
+  const cy=(m.t+pB)/2;
+  s+='<text class="axtitle" x="20" y="'+cy+'" transform="rotate(-90 20 '+cy+')">'+cfg.ylabel+'</text>';
+  s+='<text class="axtitle" x="'+((m.l+pR)/2)+'" y="'+(H-8)+'">'+XAXIS_TITLE+'</text>';
+
+  // -- data lines + latest-value dot + peak/valley time labels --
+  function pathFor(pts){ let d=''; pts.forEach((p,i)=>{ d+=(i?'L':'M')+X(p.t).toFixed(1)+' '+Y(p.v).toFixed(1)+' '; }); return d; }
+  function drawPeaks(x){
+    if(x.s.noPeaks) return;
+    const lv=x.pts[x.pts.length-1];
+    s+='<circle cx="'+X(lv.t)+'" cy="'+Y(lv.v)+'" r="3.5" fill="'+x.s.color+'"/>';
+    let pk=x.pts[0], vy=x.pts[0];
+    x.pts.forEach(p=>{ if(p.v>pk.v)pk=p; if(p.v<vy.v)vy=p; });
+    s+=peakLabel(X(pk.t),Y(pk.v),x.s.color,fmtHM(pk.t),'up');
+    if(vy.t!==pk.t) s+=peakLabel(X(vy.t),Y(vy.v),x.s.color,fmtHM(vy.t),'down');
+  }
+  // solid own-sensor lines are drawn first (bottom layer)
+  sp.filter(x=>x.pts.length && !x.s.dash).forEach(x=>{
+    s+='<path d="'+pathFor(x.pts)+'" fill="none" stroke="'+x.s.color+'" stroke-width="2" stroke-linejoin="round"/>';
+    drawPeaks(x);
+  });
+  // dashed IMS reference lines are drawn on top, each with a white halo stroke
+  // underneath so the dashes stay visible even where they overlap a flat "0" line
+  sp.filter(x=>x.pts.length && x.s.dash).forEach(x=>{
+    const d=pathFor(x.pts);
+    s+='<path d="'+d+'" fill="none" stroke="#ffffff" stroke-width="4.5" stroke-linejoin="round" stroke-dasharray="6 4"/>';
+    s+='<path d="'+d+'" fill="none" stroke="'+x.s.color+'" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6 4"/>';
+    drawPeaks(x);
+  });
+
+  // -- legend, shown whenever more than one series actually has data, so the
+  // color-to-source/location mapping is always spelled out, not just implied --
+  const withData = sp.filter(x=>x.pts.length);
+  if(withData.length>1){ let lx=m.l+4; const ly=22;
+    withData.forEach(x=>{ const dashAttr=x.s.dash?' stroke-dasharray="6 4"':'';
+      s+='<line x1="'+lx+'" y1="'+ly+'" x2="'+(lx+22)+'" y2="'+ly+'" stroke="'+x.s.color+'" stroke-width="2.5"'+dashAttr+'/>'+
+        '<text class="leg" x="'+(lx+28)+'" y="'+(ly+4)+'">'+x.s.label+'</text>';
+      lx += 36 + x.s.label.length*6.6; }); }
+  return {inner:s, W, H, X, Y, sp, unit:cfg.unit, multi};
+}
+
+// ==================== SECTION: PNG export ====================
+// Re-serializes the chart's SVG onto an off-screen canvas at 3x resolution (so
+// exported figures are print-quality), then hands the resulting PNG blob to cb().
+function toPNG(built, cb){
+  const clean=document.createElementNS(SVGNS,'svg');
+  clean.setAttribute('xmlns',SVGNS); clean.setAttribute('viewBox','0 0 '+built.W+' '+built.H);
+  clean.setAttribute('width',built.W); clean.setAttribute('height',built.H);
+  clean.innerHTML='<style>'+SVGCSS+'</style>'+built.inner;
+  const data=new XMLSerializer().serializeToString(clean);
+  const img=new Image();
+  img.onload=()=>{ const sc=3, cv=document.createElement('canvas'); cv.width=built.W*sc; cv.height=built.H*sc;
+    const ctx=cv.getContext('2d'); ctx.fillStyle='#fff'; ctx.fillRect(0,0,cv.width,cv.height);
+    ctx.setTransform(sc,0,0,sc,0,0); ctx.drawImage(img,0,0); cv.toBlob(cb,'image/png'); };
+  img.onerror=()=>{ toast('Render failed'); };
+  img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(data);
+}
+
+// ==================== SECTION: assemble one chart "card" ====================
+// title + Copy/PNG buttons + current-value line + the SVG itself + a hover
+// tooltip that snaps to the nearest data point across all series on the chart.
+function makeChart(cfg){
+  const card=document.createElement('div'); card.className='card';
+  const head=document.createElement('div'); head.className='head';
+  head.innerHTML='<h3>'+cfg.title+'</h3>';
+  const built=buildSVG(cfg);
+  if(!built){ card.appendChild(head); card.insertAdjacentHTML('beforeend','<div class="empty">No data</div>'); return card; }
+
+  const btns=document.createElement('div'); btns.className='btns';
+  const bCopy=document.createElement('button'); bCopy.textContent='Copy';
+  const bPng=document.createElement('button'); bPng.textContent='PNG';
+  btns.appendChild(bCopy); btns.appendChild(bPng); head.appendChild(btns);
+  card.appendChild(head);
+
+  // "current value" line under the title, one entry per series that has data
+  let cur='';
+  built.sp.forEach(x=>{ if(x.pts.length){ const lv=x.pts[x.pts.length-1];
+    cur += '<span style="color:'+x.s.color+'">●</span> '+(built.multi?x.s.label+': ':'')+'<b>'+lv.v.toFixed(2)+' '+cfg.unit+'</b>&nbsp;&nbsp;'; } });
+  card.insertAdjacentHTML('beforeend','<div class="cur">'+cur+'</div>');
+
+  const svg=document.createElementNS(SVGNS,'svg');
+  svg.setAttribute('viewBox','0 0 '+built.W+' '+built.H);
+  svg.innerHTML='<style>'+SVGCSS+'</style>'+built.inner;
+  const {X,Y}=built;
+  // flatten every series' points into one array so hover can find the closest
+  // point across ALL lines on the chart, not just one series
+  const all=[]; built.sp.forEach(x=>x.pts.forEach(p=>all.push({t:p.t,v:p.v,label:x.s.label,color:x.s.color})));
+  const dot=document.createElementNS(SVGNS,'circle');
+  dot.setAttribute('r','4'); dot.setAttribute('fill','none'); dot.setAttribute('stroke-width','2'); dot.style.display='none'; svg.appendChild(dot);
+  svg.addEventListener('mousemove',ev=>{
+    const r=svg.getBoundingClientRect(); const sx=(ev.clientX-r.left)/r.width*built.W;
+    let near=all[0], best=1e18;
+    for(const p of all){ const dd=Math.abs(X(p.t)-sx); if(dd<best){best=dd; near=p;} }
+    dot.style.display='block'; dot.setAttribute('cx',X(near.t)); dot.setAttribute('cy',Y(near.v)); dot.setAttribute('stroke',near.color);
+    tip.style.display='block'; tip.style.left=(ev.clientX+14)+'px'; tip.style.top=(ev.clientY+14)+'px';
+    tip.innerHTML='<b>'+near.v.toFixed(2)+' '+built.unit+'</b><br>'+(built.multi?near.label+'<br>':'')+fmtFull(near.t);
+  });
+  svg.addEventListener('mouseleave',()=>{ dot.style.display='none'; tip.style.display='none'; });
+  card.appendChild(svg);
+
+  // PNG button downloads the export as "<slug>.png"
+  bPng.addEventListener('click',()=>toPNG(built,b=>{ if(!b){toast('Export failed');return;}
+    const a=document.createElement('a'); a.href=URL.createObjectURL(b); a.download=cfg.slug+'.png'; a.click(); toast('Downloaded '+cfg.slug+'.png'); }));
+  // Copy button puts the export directly on the clipboard as an image
+  bCopy.addEventListener('click',()=>toPNG(built,async b=>{ try{
+    await navigator.clipboard.write([new ClipboardItem({'image/png':b})]); toast('Copied to clipboard'); }
+    catch(e){ toast('Copy blocked here — use PNG download'); } }));
+  return card;
+}
+
+// ==================== SECTION: build every chart card ====================
+if(META.count>0){
+  const wrap=document.getElementById('charts');
+  CHARTS.forEach(c=> wrap.appendChild(makeChart(c)));
+}
+
+// ==================== SECTION: footer note + IMS attribution ====================
+// Only shown if IMS reference data is actually present in this dashboard.
+(function(){
+  const hasIMS = Object.keys(IMS).some(k=>(IMS[k]||[]).length>0);
+  let html = 'Generated locally from Blues Notehub weather.qo events. Times shown in your browser\'s local timezone.<br>'
+    + 'Rainfall note: the gauge\'s reading is <b>not</b> a true running total since deployment -- it has been observed '
+    + 'to drop back toward 0 mid-deployment (most likely reset by the board\'s 10-minute power cycle), so treat each '
+    + 'point as "rain reported by the gauge at that reading," not a cumulative season total.<br>';
+  if(hasIMS){
+    html += 'Reference data (grey dashed lines): Israel Meteorological Service (IMS) &mdash; Sde Boker station '
+          + '(temperature, humidity, rainfall) and Ashalim station (~15 km away; solar radiation, pressure), both at '
+          + '10-minute resolution. IMS rainfall is shown as a running cumulative sum over the displayed period, for '
+          + 'comparison with the gauge\'s reading. IMS data typically lags several hours behind real time (automated '
+          + 'quality-control delay), so the most recent hours may not yet appear on IMS lines. Data retrieved via the '
+          + '<a href="https://ims.gov.il/en/ObservationDataAPI" target="_blank" rel="noopener">IMS Observation Data API</a>; '
+          + 'not an official IMS publication.<br>';
+  }
+  html += 'Re-run station_dashboard.py to refresh.';
+  document.getElementById('footer').innerHTML = html;
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# =============================== MAIN DRIVER ========================================
+def main():
+    if not TOKEN or not PROJECT_UID:
+        print("Missing Notehub token or project UID. Create notehub_secret.txt beside this\n"
+              "script with two lines:\n"
+              "  NOTEHUB_TOKEN=your_token\n"
+              "  NOTEHUB_PROJECT_UID=com.your-namespace:your_project\n"
+              "(or set those same names as environment variables).")
+        sys.exit(1)
+
+    print(f"Fetching '{NOTEFILE}' events from Notehub ...")
+    events = fetch_events()
+    rows = to_rows(events)
+    print(f"Got {len(rows)} readings.")
+
+    if IMS_TOKEN:
+        ims_series = fetch_ims_all(rows)
+    else:
+        ims_series = None
+        print("No IMS_TOKEN set -- skipping IMS reference overlay (add IMS_TOKEN=... to "
+              "notehub_secret.txt to enable).")
+
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), OUT_PATH)
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(build_html(rows, ims_series))
+    print(f"Wrote {out}")
+
+    if OPEN_BROWSER:
+        webbrowser.open("file://" + out)
+
+
+if __name__ == "__main__":
+    main()
