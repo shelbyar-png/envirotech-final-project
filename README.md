@@ -20,7 +20,6 @@ This project was developed for the graduate-level course **"Envirotech: DIY Sens
 ## Repository Contents
 The Arduino firmware is included here. The full project report is provided in this repository and covers:
 
-## Repository Contents
 - **Arduino firmware**, plus `secrets.h.example` (copy to `secrets.h` and add your own Notehub product UID before building — this file is git-ignored)
 - **dashboard generator code** — pulls station + IMS reference data via API and generates the comparison dashboard (see [Dashboard & Validation](#dashboard--validation) below)
 - `BILL_OF_MATERIALS.md` — full parts list with costs, links, and specs
