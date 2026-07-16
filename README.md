@@ -4,7 +4,7 @@ A low-power remote weather station built on an **Adafruit Feather M0 Adalogger**
 
 The system is **solar powered**, running on a solar panel and rechargeable battery pack, allowing it to operate autonomously off-grid.
 
-**Measured parameters:** air temperature & humidity, barometric pressure, rainfall, and solar irradiance.
+**Measured parameters:** air temperature & humidity, barometric pressure, rainfall, and solar radiation.
 
 ## About
 This project was developed for the graduate-level course **"Envirotech: DIY Sensors for Environmental Research"** taught by **Prof. Elad Levintal** at **Ben-Gurion University of the Negev**.
