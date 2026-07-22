@@ -124,12 +124,12 @@ void setup() {
     JAddStringToObject(req, "file", "weather.qo"); // Assigns the structural footprint filter specifically to your target weather files.
     J * body = JAddObjectToObject(req, "body"); // Allocates a permanent structured nested data container inside the configuration object.
     JAddNumberToObject(body, "time_ms", 14);     // Declares uptime as a 4-byte signed integer field.
-    JAddNumberToObject(body, "sht31_t", 14.1);   // Declares air temperature as a 4-byte float field.
+    JAddNumberToObject(body, "sht31_t", 14.1);   // Declares air temperature as a 4-byte float field, meaning there is a number after the decimal
     JAddNumberToObject(body, "sht31_h", 14.1);   // Declares air humidity as a 4-byte float field.
     JAddNumberToObject(body, "icp101_t", 14.1);  // Declares die temperature as a 4-byte float field.
     JAddNumberToObject(body, "icp101_p", 14.1);  // Declares barometric pressure as a 4-byte float field.
     JAddNumberToObject(body, "rain_mm", 14.1);   // Declares rain accumulation as a 4-byte float field.
-    JAddNumberToObject(body, "solar_w", 12);     // Declares solar irradiance as a 2-byte signed integer field.
+    JAddNumberToObject(body, "solar_w", 12);     // Declares solar irradiance as a 2-byte signed integer field, meaning no numbers after decimal
     notecard.sendRequest(req); // Commits the schema matrix down to the modem so it can squeeze data arrays into raw bitwise blocks.
   }
   delay(50); // Lets the modem finish processing before the next command.
