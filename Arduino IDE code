@@ -1,11 +1,10 @@
-/*
  * ==================================================================================
  * Feather M0 Low-Power Remote Weather Station Array with Notecard Modem
  * Sensors: SHT31, ICP10111 (Pressure/Temp), SEN0575 Rain Gauge, RS485 Solar
  * I2C (SHT31/ICP/Rain): via DFRobot Gravity TCA9548A I2C Multiplexer (addr 0x70)
  *   on the Feather's main I2C bus — CH0=SHT31, CH1=ICP10111, CH2=Rain gauge
  * Storage: SanDisk Ultra 32GB MicroSD on Adalogger Hardware (Pin 4)
- * Modem: Blues Wireless Notecard (I2C Mode) with ATTN wired to Feather EN Pin
+ * Modem: Blues Wireless Notecard (Serial Mode on Serial1 / pins 0-1) with ATTN wired to Feather EN Pin
  * RS485 Solar: Software SERCOM1 UART on pins 10 (RX) / 11 (TX)
  * Execution: 10-Minute Power-Gated Wake Cycles / 60-Minute Notehub Sync Window
  * ==================================================================================
@@ -23,7 +22,7 @@
 #include "wiring_private.h"         // Exposes pinPeripheral() so pins 10/11 can be remapped to a SERCOM UART.
 
 // ---- 2. SETTINGS, HARDWARE ADDRESSES & TARGET FILE PATHS ----
-#include "secrets.h"                // Defines productUID (Notehub product UID). Kept in a git-ignored file so ID is never published; copy secrets.h.example to secrets.h to build.
+#define productUID "com.gmail.kaplan5393:envirotech_mini_met_station" // Your unique Notehub cloud project identifier.
 const uint8_t MUX_ADDR   = 0x70;           // Fixed I2C address of the DFRobot Gravity TCA9548A multiplexer.
 const uint8_t SHT_CH     = 0;              // Multiplexer channel wired to the SHT31 temp/RH probe.
 const uint8_t PRESS_CH   = 1;              // Multiplexer channel wired to the ICP10111 pressure sensor.
@@ -91,11 +90,12 @@ void setup() {
 
   Wire.begin(); // Spins up internal peripheral registers to establish the primary hardware I2C bus that reaches the multiplexer.
 
-  // ---- INITIALIZE CELLULAR NOTECARD MODEM (I2C MODE) ----
+  // ---- INITIALIZE CELLULAR NOTECARD MODEM (SERIAL MODE) ----
   Serial.print("Initializing Blues Wireless Notecard... "); // Logs intent to register and communicate with the modem module.
-  notecard.begin();                                         // Connects the processor to the Notecard over the I2C bus.
+  //notecard.begin(Serial1, 9600);                            // Connects the processor to the Notecard over hardware Serial1 (pins 0/1) at 9600 baud.
+  notecard.begin();
   notecard.setDebugOutputStream(Serial);                    // Routes internal modem transmission logs to print directly to your monitor screen.
-  delay(50);                                                // Gives the link a moment to stabilize before the first command.
+  delay(50);                                                // Gives the serial link a moment to stabilize before the first command.
   Serial.println("✅ Online!");                             // Signals successful communication handshake with the cell module.
 
   // ---- CONFIGURE MODEM LOGIC & OUTBOUND ROUTING PATTERNS ----
@@ -106,7 +106,7 @@ void setup() {
     JAddNumberToObject(req, "outbound", 60); // Establishes your explicit 60-minute cloud data synchronization interval threshold.
     notecard.sendRequest(req); // Dispatches the completed settings command directly to the internal memory registers of the modem.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- OPTIMIZE CELLULAR POWER CHARGING VOLTAGES FOR LIPO CELLS ----
   {
@@ -114,7 +114,7 @@ void setup() {
     JAddStringToObject(req, "mode", "lipo"); // Commands the modem to calibrate its safety sensors specifically for standard Lithium Polymer cells.
     notecard.sendRequest(req); // Commits the power-saving charging parameters directly to the modem motherboard storage layers.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- ESTABLISH MASTER DATA TEMPLATE FOR cellular OPTIMIZATION ----
   // NOTE: template values are Blues TYPE INDICATORS, not sample data:
@@ -132,7 +132,7 @@ void setup() {
     JAddNumberToObject(body, "solar_w", 12);     // Declares solar irradiance as a 2-byte signed integer field.
     notecard.sendRequest(req); // Commits the schema matrix down to the modem so it can squeeze data arrays into raw bitwise blocks.
   }
-  delay(50); // Lets the modem finish processing before the next command.
+  delay(50); // Lets the serial-mode modem finish processing before the next command.
 
   // ---- INITIALIZE DETACHED ARRAYS & STARTUP CHECKS ----
   bool shtHardwareOK   = probeI2CDevice(SHT_CH, SHT31_ADDR, "SHT31 Temp/RH"); // Selects CH0 and wire-checks the air sensor.
@@ -211,4 +211,60 @@ void setup() {
   delay(50); // Brief pause to let the RS485 line settle after the I2C bus activity above.
   uint8_t modbusResult = solarNode.readHoldingRegisters(0x0000, 1); // Dispatches a packet to pull current light measurements from register 0.
   if (modbusResult == solarNode.ku8MBSuccess) { solar_Wm2 = solarNode.getResponseBuffer(0); solarReadSuccess = true; } // A returned value of 0 W/m2 (e.g. nighttime) is a valid successful reading — only a failed Modbus transaction produces ERR.
-  delay(50); // Settling delay af
+  delay(50); // Settling delay after the RS485 read completes.
+
+  // ---- LOCAL MONITOR RECONSTRUCTED LOG PRINTING OUT ----
+  Serial.print("MONITOR LOG -> "); Serial.print(currentMillis); Serial.print(", "); // Starts a new comma-separated screen stream entry row.
+  if (shtReadSuccess)   { Serial.print(sht_temp_C); Serial.print(" C, "); Serial.print(sht_hum_Perc); Serial.print(" %, "); } else { Serial.print("ERR, ERR, "); } // Prints SHT31 screen strings.
+  if (pressReadSuccess) { Serial.print(icp_temp_C); Serial.print(" C, "); Serial.print(pressure_hPa); Serial.print(" hPa, "); } else { Serial.print("ERR, ERR, "); } // Prints ICP screen strings.
+  if (rainReadSuccess)  { Serial.print(totalRain_mm, 4); Serial.print(" mm, "); } else { Serial.print("ERR, "); } // Prints precipitation values.
+  if (solarReadSuccess) { Serial.print(solar_Wm2); Serial.println(" W/m2"); } else { Serial.println("ERR"); } // Prints solar values and finishes row.
+
+  // ---- LOCAL SD BACKUP LOGGING CELL ENTRY COMMIT ----
+  if (sdHardwareOK) { // Shields memory operations against catastrophic code exceptions if physical flash cards are removed by hand.
+    File dataFile = SD.open("/MICMETST/DATA.CSV", FILE_WRITE); // Activates the direct shortened file path channel and jumps to bottom.
+    if (dataFile) { // Verifies file stream initialization succeeded before transmitting data rows over SPI copper channels.
+      dataFile.print(currentMillis); dataFile.print(","); // Commits system lifetime markers as the key indexing point for database software.
+      if (shtReadSuccess)   { dataFile.print(sht_temp_C); dataFile.print(","); dataFile.print(sht_hum_Perc); dataFile.print(","); } else { dataFile.print("ERR,ERR,"); } // Commits SHT records.
+      if (pressReadSuccess) { dataFile.print(icp_temp_C); dataFile.print(","); dataFile.print(pressure_hPa); dataFile.print(","); } else { dataFile.print("ERR,ERR,"); } // Commits pressure records.
+      if (rainReadSuccess)  { dataFile.print(totalRain_mm, 4); dataFile.print(","); } else { dataFile.print("ERR,"); } // Commits precipitation decimals.
+      if (solarReadSuccess) { dataFile.println(solar_Wm2); } else { dataFile.println("ERR"); } // Commits solar values and issues row jump commands.
+      dataFile.close(); // Empties ram buffer tracks, completes partition structural tasks, and powers down sector blocks safely.
+    }
+  }
+
+  // ---- CELLULAR MODEM CLOUD TRANSMISSION PACKAGING SYSTEM ----
+  J * req = notecard.newRequest("note.add"); // Generates a transaction packet to append a payload entry directly inside your outbound queue.
+  if (req != NULL) { // Confirms that internal microprocessor RAM allocations cleared space to construct the object securely.
+    JAddStringToObject(req, "file", "weather.qo"); // Directs the completed document container to target your optimized queue layout.
+    J * body = JAddObjectToObject(req, "body"); // Integrates a clean nested data tracking layer inside the root transaction packet.
+    if (body != NULL) { // Shields downstream assignments from memory failures if object properties generated errors.
+      JAddNumberToObject(body, "time_ms", currentMillis); // Populates the data row object with current system uptime records.
+      if (shtReadSuccess)   { JAddNumberToObject(body, "sht31_t",  sht_temp_C); JAddNumberToObject(body, "sht31_h",  sht_hum_Perc); } // Bundles air data.
+      if (pressReadSuccess) { JAddNumberToObject(body, "icp101_t", icp_temp_C); JAddNumberToObject(body, "icp101_p", pressure_hPa); } // Bundles baro metrics.
+      if (rainReadSuccess)  { JAddNumberToObject(body, "rain_mm",  totalRain_mm); } // Adds rain gauge data to payload package — 0 is a valid value here.
+      if (solarReadSuccess) { JAddNumberToObject(body, "solar_w",  solar_Wm2); } // Adds solar readings to payload package — 0 is a valid value here.
+    }
+    notecard.sendRequest(req); // Commits the structured record straight down to the cellular modem's non-volatile local database.
+    Serial.println("📡 Data package safely queued inside Notecard local storage cache!"); // Logs process confirmation to monitor.
+  }
+  delay(50); // Lets the serial-mode modem finish processing before the sleep command.
+
+  // ---- TOTAL POWER SHUTDOWN ENFORCEMENT & HARDWARE SLEEP COMMAND ----
+  Serial.println("💤 Execution complete. Requesting 10-minute total hardware power-down from Notecard ATTN..."); // Logs status.
+  delay(100); // Grants internal serial output chips a 100 millisecond window to empty data tracks before power is severed.
+
+  J * sleepCmd = NoteNewCommand("card.attn"); // Generates an un-returned power command to force systemic total circuit shutdown.
+  JAddStringToObject(sleepCmd, "mode", "sleep"); // Switches the internal auxiliary hardware control loops into deep sleeping modes.
+  JAddNumberToObject(sleepCmd, "seconds", WAKE_PERIOD_S); // Commands the internal tracking countdown clocks to monitor 600 total seconds.
+  notecard.sendRequest(sleepCmd); // Pushes the final shutdown trigger out across the wires to initiate total station hibernation.
+
+  Serial.println("⚠️ If you read this line, the ATTN-to-EN wire link is disconnected or broken!"); // Warns user if power cut fails.
+}
+
+void loop() {
+  // Under standard operational states, this code section will remain completely un-reached because the physical board power lines
+  // are mechanically severed by the modem at the end of setup(). This backup loop serves strictly as an emergency fallback safety net
+  // to protect battery reserves against system drain if hardware control wires drop out or fail to execute power cuts.
+  delay(1000); // Forces the processor to sit in a low-power 1-second pause loop if sleep triggers fail.
+}
