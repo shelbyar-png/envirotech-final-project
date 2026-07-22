@@ -1,10 +1,11 @@
+/*
  * ==================================================================================
  * Feather M0 Low-Power Remote Weather Station Array with Notecard Modem
  * Sensors: SHT31, ICP10111 (Pressure/Temp), SEN0575 Rain Gauge, RS485 Solar
  * I2C (SHT31/ICP/Rain): via DFRobot Gravity TCA9548A I2C Multiplexer (addr 0x70)
  *   on the Feather's main I2C bus — CH0=SHT31, CH1=ICP10111, CH2=Rain gauge
  * Storage: SanDisk Ultra 32GB MicroSD on Adalogger Hardware (Pin 4)
- * Modem: Blues Wireless Notecard (Serial Mode on Serial1 / pins 0-1) with ATTN wired to Feather EN Pin
+ * Modem: Blues Wireless Notecard (I2C Mode) with ATTN wired to Feather EN Pin
  * RS485 Solar: Software SERCOM1 UART on pins 10 (RX) / 11 (TX)
  * Execution: 10-Minute Power-Gated Wake Cycles / 60-Minute Notehub Sync Window
  * ==================================================================================
@@ -22,7 +23,7 @@
 #include "wiring_private.h"         // Exposes pinPeripheral() so pins 10/11 can be remapped to a SERCOM UART.
 
 // ---- 2. SETTINGS, HARDWARE ADDRESSES & TARGET FILE PATHS ----
-#define productUID "com.gmail.kaplan5393:envirotech_mini_met_station" // Your unique Notehub cloud project identifier.
+#include "secrets.h"                // Defines productUID (your Notehub product UID). Kept in a git-ignored file so your ID is never published; copy secrets.h.example to secrets.h to build.
 const uint8_t MUX_ADDR   = 0x70;           // Fixed I2C address of the DFRobot Gravity TCA9548A multiplexer.
 const uint8_t SHT_CH     = 0;              // Multiplexer channel wired to the SHT31 temp/RH probe.
 const uint8_t PRESS_CH   = 1;              // Multiplexer channel wired to the ICP10111 pressure sensor.
@@ -90,12 +91,11 @@ void setup() {
 
   Wire.begin(); // Spins up internal peripheral registers to establish the primary hardware I2C bus that reaches the multiplexer.
 
-  // ---- INITIALIZE CELLULAR NOTECARD MODEM (SERIAL MODE) ----
+  // ---- INITIALIZE CELLULAR NOTECARD MODEM (I2C MODE) ----
   Serial.print("Initializing Blues Wireless Notecard... "); // Logs intent to register and communicate with the modem module.
-  //notecard.begin(Serial1, 9600);                            // Connects the processor to the Notecard over hardware Serial1 (pins 0/1) at 9600 baud.
-  notecard.begin();
+  notecard.begin();                                         // Connects the processor to the Notecard over the I2C bus.
   notecard.setDebugOutputStream(Serial);                    // Routes internal modem transmission logs to print directly to your monitor screen.
-  delay(50);                                                // Gives the serial link a moment to stabilize before the first command.
+  delay(50);                                                // Gives the link a moment to stabilize before the first command.
   Serial.println("✅ Online!");                             // Signals successful communication handshake with the cell module.
 
   // ---- CONFIGURE MODEM LOGIC & OUTBOUND ROUTING PATTERNS ----
@@ -106,7 +106,7 @@ void setup() {
     JAddNumberToObject(req, "outbound", 60); // Establishes your explicit 60-minute cloud data synchronization interval threshold.
     notecard.sendRequest(req); // Dispatches the completed settings command directly to the internal memory registers of the modem.
   }
-  delay(50); // Lets the serial-mode modem finish processing before the next command.
+  delay(50); // Lets the modem finish processing before the next command.
 
   // ---- OPTIMIZE CELLULAR POWER CHARGING VOLTAGES FOR LIPO CELLS ----
   {
@@ -114,7 +114,7 @@ void setup() {
     JAddStringToObject(req, "mode", "lipo"); // Commands the modem to calibrate its safety sensors specifically for standard Lithium Polymer cells.
     notecard.sendRequest(req); // Commits the power-saving charging parameters directly to the modem motherboard storage layers.
   }
-  delay(50); // Lets the serial-mode modem finish processing before the next command.
+  delay(50); // Lets the modem finish processing before the next command.
 
   // ---- ESTABLISH MASTER DATA TEMPLATE FOR cellular OPTIMIZATION ----
   // NOTE: template values are Blues TYPE INDICATORS, not sample data:
@@ -132,7 +132,7 @@ void setup() {
     JAddNumberToObject(body, "solar_w", 12);     // Declares solar irradiance as a 2-byte signed integer field.
     notecard.sendRequest(req); // Commits the schema matrix down to the modem so it can squeeze data arrays into raw bitwise blocks.
   }
-  delay(50); // Lets the serial-mode modem finish processing before the next command.
+  delay(50); // Lets the modem finish processing before the next command.
 
   // ---- INITIALIZE DETACHED ARRAYS & STARTUP CHECKS ----
   bool shtHardwareOK   = probeI2CDevice(SHT_CH, SHT31_ADDR, "SHT31 Temp/RH"); // Selects CH0 and wire-checks the air sensor.
@@ -248,7 +248,7 @@ void setup() {
     notecard.sendRequest(req); // Commits the structured record straight down to the cellular modem's non-volatile local database.
     Serial.println("📡 Data package safely queued inside Notecard local storage cache!"); // Logs process confirmation to monitor.
   }
-  delay(50); // Lets the serial-mode modem finish processing before the sleep command.
+  delay(50); // Lets the modem finish processing before the sleep command.
 
   // ---- TOTAL POWER SHUTDOWN ENFORCEMENT & HARDWARE SLEEP COMMAND ----
   Serial.println("💤 Execution complete. Requesting 10-minute total hardware power-down from Notecard ATTN..."); // Logs status.
